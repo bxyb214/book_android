@@ -1,0 +1,365 @@
+package com.songzi.book.fragment;
+
+import java.io.IOException;
+import java.util.ArrayList;
+
+import uk.co.senab.actionbarpulltorefresh.extras.actionbarsherlock.PullToRefreshLayout;
+import android.content.Context;
+import android.content.Intent;
+import android.os.Bundle;
+import android.support.annotation.Nullable;
+import android.text.TextUtils;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.AbsListView;
+import android.widget.AbsListView.OnScrollListener;
+import android.widget.AdapterView;
+import android.widget.AdapterView.OnItemClickListener;
+import android.widget.ListView;
+import android.widget.ProgressBar;
+
+import com.songzi.book.Constants;
+import com.songzi.book.R;
+import com.songzi.book.BookApplication;
+import com.songzi.book.activity.NewsDetailActivity;
+import com.songzi.book.adapter.NewsAdapter;
+import com.songzi.book.db.NewsDataSource;
+import com.songzi.book.entity.NewsListEntity;
+import com.songzi.book.entity.NewsListEntity.NewsEntity;
+import com.songzi.book.task.BaseGetNewsTask;
+import com.songzi.book.task.BaseGetNewsTask.ResponseListener;
+import com.songzi.book.task.GetLatestNewsTask;
+import com.songzi.book.task.MyAsyncTask;
+import com.songzi.book.util.GsonUtils;
+import com.songzi.book.util.ListUtils;
+import com.songzi.book.util.BookUtils;
+
+public class NewsListFragment extends BaseFragment implements ResponseListener, OnItemClickListener {
+
+	private ListView mListView;
+	private ProgressBar mProgressBar;
+	private NewsAdapter mAdapter = null;
+	
+	private ArrayList<NewsEntity> mNewsList = null;
+	
+	//上次listView滚动到最下方时，itemId
+	private int mListViewPreLast = 0;
+	private String mCurrentDate = null;
+	
+	@Override
+	public void onCreate(Bundle savedInstanceState) {
+		super.onCreate(savedInstanceState);
+		
+		new LoadCacheNewsTask().executeOnExecutor(MyAsyncTask.THREAD_POOL_EXECUTOR);
+		
+		new GetLatestNewsTask(getActivity(), this).executeOnExecutor(MyAsyncTask.THREAD_POOL_EXECUTOR);
+	}
+	
+	@Override
+	public View onCreateView(LayoutInflater inflater, ViewGroup container,
+			Bundle savedInstanceState) {
+		
+		View view = inflater.inflate(R.layout.fragment_main, container, false);
+		
+		mPullToRefreshLayout = (PullToRefreshLayout) view.findViewById(R.id.ptr_layout);
+		mListView = (ListView) view.findViewById(R.id.list);
+		mListView.setOnItemClickListener(this);
+		mProgressBar = (ProgressBar) view.findViewById(R.id.progress);
+		
+		return view;
+	}
+	
+	@Override
+	public void onActivityCreated(@Nullable Bundle savedInstanceState) {
+		
+		super.onActivityCreated(savedInstanceState);
+		
+		mListView.setOnScrollListener(new OnScrollListener() {
+
+			@Override
+			public void onScroll(AbsListView view, int firstVisibleItem,
+					int visibleItemCount, int totalItemCount) {
+				
+				final int lastItem = firstVisibleItem + visibleItemCount;
+				
+				if (lastItem == totalItemCount) {
+					if (mListViewPreLast != lastItem) { // to avoid multiple calls for
+						
+						mCurrentDate = BookUtils.getBeforeDate(mCurrentDate);
+						
+						new GetMoreNewsTask(getActivity(), null).executeOnExecutor(MyAsyncTask.THREAD_POOL_EXECUTOR, mCurrentDate);
+						
+						mListViewPreLast = lastItem;
+					}
+				}
+			}
+			
+			@Override
+			public void onScrollStateChanged(AbsListView view, int scrollState) {
+				
+			}
+		});
+	}
+
+	private void setAdapter(ArrayList<NewsEntity> newsList) {
+		if (mAdapter == null) {
+			mAdapter = new NewsAdapter(getActivity(), newsList);
+			mListView.setAdapter(mAdapter);
+		} else {
+			mAdapter.updateData(newsList);
+		}
+	}
+
+	private void setListShown(boolean isListViewShown) {
+		mListView.setVisibility(isListViewShown ? View.VISIBLE : View.GONE);
+		mProgressBar.setVisibility(isListViewShown ? View.GONE : View.VISIBLE);
+	}
+	
+	//读取缓存中的最新新闻
+	private class LoadCacheNewsTask extends MyAsyncTask<String, Void, NewsListEntity> {
+
+		@Override
+		protected NewsListEntity doInBackground(String... params) {
+
+			NewsListEntity latestNewsEntity = BookApplication.getDataSource().getLatestNews();
+
+			if (latestNewsEntity != null) {
+				mCurrentDate = latestNewsEntity.date;
+				BookUtils.setReadStatus4NewsList(latestNewsEntity.stories);
+			}
+			
+			return latestNewsEntity;
+		}
+
+		@Override
+		protected void onPostExecute(NewsListEntity result) {
+			super.onPostExecute(result);
+			
+			if(!isAdded())
+				return;
+			
+			if (result != null && !ListUtils.isEmpty(result.stories)) {
+				
+				NewsEntity tagNewsEntity = new NewsEntity();
+				tagNewsEntity.isTag = true;
+				tagNewsEntity.title = result.date;
+				
+				mNewsList = new ArrayList<NewsEntity>();
+				mNewsList.add(tagNewsEntity);
+				mNewsList.addAll(result.stories);
+				
+				setAdapter(mNewsList);
+			}
+		}
+	}
+	
+	//下载过往的新闻
+	private class GetMoreNewsTask extends BaseGetNewsTask {
+
+		public GetMoreNewsTask(Context context, ResponseListener listener) {
+			super(context, listener);
+		}
+		
+		@Override
+		protected NewsListEntity doInBackground(String... params) {
+			
+			if (params.length == 0)
+				return null;
+			
+			String theKey = params[0];
+			
+			String oldContent = ((NewsDataSource) getDataSource()).getContent(theKey);
+			
+			NewsListEntity newsListEntity = null;
+			
+			if (!TextUtils.isEmpty(oldContent)) {
+				newsListEntity = (NewsListEntity) GsonUtils.getEntity(oldContent, NewsListEntity.class);
+				if (newsListEntity != null) {
+					BookUtils.setReadStatus4NewsList(newsListEntity.stories);
+				}
+				return newsListEntity;
+			} else {
+				
+				String newContent = null;
+				
+				try {
+					newContent = getUrl(Constants.Url.URLDEFORE + BookUtils.getAddedDate(theKey));
+	
+					newsListEntity = (NewsListEntity)GsonUtils.getEntity(newContent, NewsListEntity.class);
+					
+					isRefreshSuccess = !ListUtils.isEmpty(newsListEntity.stories);
+				} catch (IOException e) {
+					e.printStackTrace();
+					
+					this.isRefreshSuccess = false;
+					this.mException = e;
+				} catch (Exception e) {
+					e.printStackTrace();
+
+					this.isRefreshSuccess = false;
+					this.mException = e;
+				}
+				
+				isContentSame = checkIsContentSame(oldContent, newContent);
+				
+				if (isRefreshSuccess && !isContentSame) {
+					((NewsDataSource) getDataSource()).insertOrUpdateNewsList(Constants.NEWS_LIST, theKey, newContent);
+				}
+				
+				if (newsListEntity != null) {
+					BookUtils.setReadStatus4NewsList(newsListEntity.stories);
+				}
+				
+				return newsListEntity;
+			}
+		}
+
+		@Override
+		protected void onPostExecute(NewsListEntity result) {
+			super.onPostExecute(result);
+
+			if(!isAdded())
+				return;
+			
+			setListShown(true);
+
+			mListViewPreLast = 0;
+			
+			if (mNewsList == null) {
+				mNewsList = new ArrayList<NewsEntity>();
+			}
+			
+			if (result != null && !ListUtils.isEmpty(result.stories)) {
+				
+				NewsEntity tagNewsEntity = new NewsEntity();
+				tagNewsEntity.isTag = true;
+				tagNewsEntity.title = result.date;
+				mNewsList.add(tagNewsEntity);
+				mNewsList.addAll(result.stories);
+				
+				setAdapter(mNewsList);
+			}
+		}
+	}
+	
+	@Override
+	public void onPreExecute() {
+		
+	}
+
+	@Override
+	public void onProgressUpdate(String value) {
+		
+	}
+	
+	@Override
+	public void onPostExecute(NewsListEntity result) {
+		if(!isAdded())
+			return;
+		
+		// Notify PullToRefreshLayout that the refresh has finished
+		mPullToRefreshLayout.setRefreshComplete();
+					
+		if (getView() != null) {
+			// Show the list again
+			setListShown(true);
+		}
+		
+		if (result != null) {
+			mNewsList = new ArrayList<NewsEntity>();
+
+			NewsEntity tagNewsEntity = new NewsEntity();
+			tagNewsEntity.isTag = true;
+			tagNewsEntity.title = result.date;
+			mNewsList.add(tagNewsEntity);
+
+			mNewsList.addAll(result.stories);
+
+			mCurrentDate = result.date;
+
+			setAdapter(mNewsList);
+		}
+	}
+	
+	@Override
+	public void onFail(Exception e) {
+		
+		if (getView() != null) {
+			// Show the list again
+			setListShown(true);
+		}
+		
+		dealException(e);
+	}
+
+	@Override
+	protected void doRefresh() {
+		
+		// Hide the list
+		setListShown( mNewsList==null ||mNewsList.isEmpty() ? false : true );
+		
+		new GetLatestNewsTask(getActivity(), this).executeOnExecutor(MyAsyncTask.THREAD_POOL_EXECUTOR);
+	}
+	
+	@Override
+	public void onItemClick(AdapterView<?> parent, View view, int position, long id) {
+		
+		NewsEntity newsEntity = mNewsList != null ? mNewsList.get(position) : null;
+
+		if (newsEntity == null)
+			return;
+
+		Intent intent = new Intent();
+		intent.putExtra("id", newsEntity.id);
+		intent.putExtra("newsEntity", newsEntity);
+
+		intent.setClass(getActivity(), NewsDetailActivity.class);
+		startActivity(intent);
+		
+		new SetReadFlagTask(newsEntity).executeOnExecutor(MyAsyncTask.THREAD_POOL_EXECUTOR);
+	}
+	
+	public void updateList() {
+		new LoadCacheNewsTask().executeOnExecutor(MyAsyncTask.THREAD_POOL_EXECUTOR);
+	}
+
+	@Override
+	protected void onRestoreState(Bundle savedInstanceState) {
+
+	}
+
+	@Override
+	protected void onSaveState(Bundle outState) {
+
+	}
+
+	@Override
+	protected void onFirstTimeLaunched() {
+
+	}
+	
+	private class SetReadFlagTask extends MyAsyncTask<String, Void, Boolean> {
+
+		private NewsEntity mNewsEntity;
+
+		public SetReadFlagTask(NewsEntity newsEntity) {
+			mNewsEntity = newsEntity;
+		}
+
+		@Override
+		protected Boolean doInBackground(String... params) {
+			return BookApplication.getNewsReadDataSource().readNews(String.valueOf(mNewsEntity.id));
+		}
+
+		@Override
+		protected void onPostExecute(Boolean result) {
+			super.onPostExecute(result);
+
+			if (result) {
+				BookUtils.setReadStatus4NewsEntity(mNewsList, mNewsEntity);
+				mAdapter.updateData(mNewsList);
+			}
+		}
+	}
+}
